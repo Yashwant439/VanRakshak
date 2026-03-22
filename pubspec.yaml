@@ -1,0 +1,63 @@
+name: van_rakshak
+description: "Offline-first, edge AI-powered wildlife protection system."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  
+  # ML & Audio
+  tflite_flutter: ^0.12.0
+  record: ^6.1.0
+  audioplayers: ^6.0.0
+  
+  # State Management
+  provider: ^6.1.0
+  
+  # Storage
+  hive: ^2.2.3
+  hive_flutter: ^1.1.0
+  
+  # UI
+  fl_chart: ^0.68.0
+  intl: ^0.19.0
+  cupertino_icons: ^1.0.2
+  google_fonts: ^6.1.0
+  
+  # Permissions
+  permission_handler: ^11.4.0
+  
+  # RunAnywhere (Offline LLM)
+  # runanywhere_flutter: ^0.0.1
+  runanywhere: ^0.15.9
+  runanywhere_onnx: ^0.15.9      # STT, TTS, VAD
+  runanywhere_llamacpp: ^0.15.9  # LLM text generation
+  
+  # Utilities
+  uuid: ^4.0.0
+  path_provider: ^2.1.1
+  path: ^1.9.0
+  shared_preferences: ^2.2.2
+  csv: ^6.0.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+  build_runner: ^2.4.7
+  hive_generator: ^2.0.1
+
+flutter:
+  uses-material-design: true
+  
+  assets:
+    - assets/models/
+    - assets/audio/
+    - assets/labels/
+  
+
