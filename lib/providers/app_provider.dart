@@ -23,9 +23,17 @@ class AppProvider extends ChangeNotifier {
   double _sensitivity = 0.5;
   bool _lowPowerMode = false;
   int _unreadAlerts = 0;
+  bool _isDemoMode = false;
 
-  // Detection stream
-  Timer? _detectionTimer;
+  // Detection state
+  DetectionResult? _lastDetectionResult;
+  List<DetectionResult> _detectionHistory = [];
+  StreamSubscription<List<double>>? _audioSubscription;
+
+  // Temporal smoothing: require N consecutive threat frames to trigger alert
+  static const int _consecutiveFramesRequired = 2;
+  int _consecutiveThreatFrames = 0;
+  String? _lastThreatCategory;
 
   // Getters
   bool get isListening => _isListening;
@@ -36,7 +44,9 @@ class AppProvider extends ChangeNotifier {
   double get sensitivity => _sensitivity;
   bool get lowPowerMode => _lowPowerMode;
   int get unreadAlerts => _unreadAlerts;
-
+  bool get isDemoMode => _isDemoMode;
+  DetectionResult? get lastDetectionResult => _lastDetectionResult;
+  List<DetectionResult> get detectionHistory => List.unmodifiable(_detectionHistory);
   List<Alert> get alerts => alertService.alerts;
 
   AppProvider({
@@ -54,17 +64,27 @@ class AppProvider extends ChangeNotifier {
     _sensitivity = storageService.getSensitivity();
     _currentZone = storageService.getCurrentZone();
     _lowPowerMode = storageService.getLowPowerMode();
-    
+
     // Load previous alerts
     final saved = storageService.getAlerts();
     alertService.alerts = saved;
-    
+
     // Load model
+    _detectionStatus = 'Loading model...';
+    notifyListeners();
+
     await mlService.loadModel();
-    
+
+    if (mlService.isModelLoaded) {
+      _detectionStatus = 'Model loaded. Ready.';
+    } else {
+      _detectionStatus = 'Failed to load model';
+    }
+
     notifyListeners();
   }
 
+  /// Start real-time continuous listening and detection.
   Future<void> startListening() async {
     try {
       _detectionStatus = 'Requesting permission...';
@@ -77,78 +97,149 @@ class AppProvider extends ChangeNotifier {
         return;
       }
 
-      await audioService.startRecording();
+      if (!mlService.isModelLoaded) {
+        _detectionStatus = 'Loading model...';
+        notifyListeners();
+        await mlService.loadModel();
+        if (!mlService.isModelLoaded) {
+          _detectionStatus = 'Model failed to load';
+          notifyListeners();
+          return;
+        }
+      }
+
+      // Start continuous audio streaming
+      await audioService.startContinuousListening();
       _isListening = true;
+      _isDemoMode = false;
+      _consecutiveThreatFrames = 0;
+      _lastThreatCategory = null;
       _detectionStatus = 'Listening...';
       notifyListeners();
 
-      // Simulate continuous detection (in production, process real audio stream)
-      _startDetectionLoop();
+      // Subscribe to audio frames for real-time inference
+      _audioSubscription = audioService.audioFrameStream.listen(
+        _onAudioFrame,
+        onError: (e) {
+          print('AppProvider: Audio stream error: $e');
+          _detectionStatus = 'Audio error: $e';
+          notifyListeners();
+        },
+      );
     } catch (e) {
       _detectionStatus = 'Error: $e';
       notifyListeners();
     }
   }
 
+  /// Stop listening.
   Future<void> stopListening() async {
     try {
-      final audioBytes = await audioService.stopRecording();
+      _audioSubscription?.cancel();
+      _audioSubscription = null;
+
+      await audioService.stopContinuousListening();
       _isListening = false;
-      _detectionTimer?.cancel();
+      _consecutiveThreatFrames = 0;
+      _lastThreatCategory = null;
       _detectionStatus = 'Idle';
       notifyListeners();
-
-      if (audioBytes != null) {
-        await _processAudio(audioBytes);
-      }
     } catch (e) {
       _detectionStatus = 'Error: $e';
       notifyListeners();
     }
   }
 
-  void _startDetectionLoop() {
-    // Simulate audio chunk processing every 2 seconds
-    _detectionTimer = Timer.periodic(const Duration(seconds: 2), (_) async {
-      // In production, process real audio chunks from the stream
-      // For demo, simulate random detections based on sensitivity
-      final shouldDetect = (_sensitivity > 0.3);
-      
-      if (shouldDetect && _isListening) {
-        // Simulate inference
-        final fakeDetection = _generateDemoDetection();
-        if (fakeDetection != null) {
-          alertService.createAlert(fakeDetection, _currentZone);
-          _lastDetectedLabel = fakeDetection.label;
-          _lastConfidence = fakeDetection.confidence;
-          await storageService.saveAlert(alertService.alerts.first);
-          _unreadAlerts++;
-          notifyListeners();
+  /// Process a single audio frame from the continuous stream.
+  Future<void> _onAudioFrame(List<double> frame) async {
+    if (!_isListening) return;
+
+    try {
+      // Run inference
+      final detection = await mlService.detectFromAudio(frame);
+
+      if (detection == null) {
+        _detectionStatus = 'Listening... (no result)';
+        notifyListeners();
+        return;
+      }
+
+      // Store in history
+      _lastDetectionResult = detection;
+      _detectionHistory.add(detection);
+      if (_detectionHistory.length > 100) {
+        _detectionHistory.removeAt(0);
+      }
+
+      // Update display
+      _detectionStatus =
+          'Listening... ${detection.rawYamnetTopLabel} (${(detection.confidence * 100).toStringAsFixed(0)}%)';
+
+      // Check if this is a threat detection
+      if (detection.isThreat && detection.confidence >= _sensitivity) {
+        // Temporal smoothing: count consecutive threat frames
+        if (_lastThreatCategory == detection.label) {
+          _consecutiveThreatFrames++;
+        } else {
+          _consecutiveThreatFrames = 1;
+          _lastThreatCategory = detection.label;
+        }
+
+        // Only trigger alert after N consecutive consistent threat frames
+        if (_consecutiveThreatFrames >= _consecutiveFramesRequired) {
+          _triggerAlert(detection);
+          _consecutiveThreatFrames = 0; // Reset after triggering
+        }
+      } else {
+        // No threat → decay the counter
+        if (_consecutiveThreatFrames > 0) {
+          _consecutiveThreatFrames--;
         }
       }
-    });
+
+      notifyListeners();
+    } catch (e) {
+      print('AppProvider: Error processing frame: $e');
+    }
   }
 
-  Future<void> _processAudio(Uint8List audioBytes) async {
+  /// Trigger an alert from a confirmed detection.
+  Future<void> _triggerAlert(DetectionResult detection) async {
+    alertService.createAlert(detection, _currentZone);
+    _lastDetectedLabel = detection.label;
+    _lastConfidence = detection.confidence;
+    await storageService.saveAlert(alertService.alerts.first);
+    await storageService.saveLastDetectionTime(detection.timestamp);
+    _unreadAlerts++;
+
+    _detectionStatus = '🚨 Detected: ${detection.label} '
+        '(${(detection.confidence * 100).toStringAsFixed(0)}%)';
+
+    print('ALERT TRIGGERED: $detection');
+    notifyListeners();
+  }
+
+  /// Process a one-shot audio recording (when user manually records and stops).
+  Future<void> processRecordedAudio(Uint8List audioBytes) async {
     try {
-      _detectionStatus = 'Processing...';
+      _detectionStatus = 'Processing recording...';
       notifyListeners();
 
       // Convert bytes to float32
       final float32 = audioService.convertBytesToFloat32(audioBytes);
 
-      // Run inference
-      final detection = await mlService.detectFromAudio(float32);
+      // Run multi-frame inference for better accuracy
+      final detection = await mlService.detectFromAudioMultiFrame(float32);
 
       if (detection != null && detection.confidence >= _sensitivity) {
-        alertService.createAlert(detection, _currentZone);
+        _triggerAlert(detection);
+      } else if (detection != null) {
         _lastDetectedLabel = detection.label;
         _lastConfidence = detection.confidence;
-        await storageService.saveAlert(alertService.alerts.first);
-        _unreadAlerts++;
-        _detectionStatus = 'Detected: ${detection.label}';
+        _detectionStatus =
+            'Detected: ${detection.rawYamnetTopLabel} (below threshold)';
       } else {
-        _detectionStatus = 'No threat detected';
+        _detectionStatus = 'No sound detected';
       }
 
       notifyListeners();
@@ -158,32 +249,9 @@ class AppProvider extends ChangeNotifier {
     }
   }
 
-  DetectionResult? _generateDemoDetection() {
-    // Simulated detection for demo mode
-    final random = DateTime.now().millisecond % 100;
-    
-    if (random < 30) {
-      return DetectionResult(
-        label: 'gunshot',
-        confidence: 0.75 + (random % 20) / 100,
-        threat: ThreatLevel.critical,
-        timestamp: DateTime.now(),
-        allPredictions: [],
-      );
-    } else if (random < 60) {
-      return DetectionResult(
-        label: 'chainsaw',
-        confidence: 0.65 + (random % 20) / 100,
-        threat: ThreatLevel.warning,
-        timestamp: DateTime.now(),
-        allPredictions: [],
-      );
-    }
-    
-    return null;
-  }
-
+  /// Simulate a detection for demo/testing purposes.
   Future<void> simulateDetection(String type) async {
+    _isDemoMode = true;
     _detectionStatus = 'Simulating $type detection...';
     notifyListeners();
 
@@ -194,16 +262,17 @@ class AppProvider extends ChangeNotifier {
       confidence: type == 'gunshot' ? 0.85 : 0.75,
       threat: type == 'gunshot' ? ThreatLevel.critical : ThreatLevel.warning,
       timestamp: DateTime.now(),
-      allPredictions: [],
+      allPredictions: [
+        PredictionScore(
+          label: type == 'gunshot' ? 'Gunshot, gunfire' : 'Chainsaw',
+          score: type == 'gunshot' ? 0.85 : 0.75,
+        ),
+      ],
+      rawYamnetTopLabel: type == 'gunshot' ? 'Gunshot, gunfire' : 'Chainsaw',
     );
 
-    alertService.createAlert(detection, _currentZone);
-    _lastDetectedLabel = type;
-    _lastConfidence = detection.confidence;
-    await storageService.saveAlert(alertService.alerts.first);
-    _unreadAlerts++;
-
-    _detectionStatus = 'Detected: $type';
+    await _triggerAlert(detection);
+    _detectionStatus = '(Demo) Detected: $type';
     notifyListeners();
   }
 
@@ -229,6 +298,10 @@ class AppProvider extends ChangeNotifier {
     alertService.clearAlerts();
     await storageService.clearAlerts();
     _unreadAlerts = 0;
+    _lastDetectedLabel = null;
+    _lastConfidence = null;
+    _lastDetectionResult = null;
+    _detectionHistory.clear();
     notifyListeners();
   }
 
@@ -241,7 +314,7 @@ class AppProvider extends ChangeNotifier {
 
   @override
   void dispose() {
-    _detectionTimer?.cancel();
+    _audioSubscription?.cancel();
     audioService.dispose();
     mlService.dispose();
     storageService.close();
